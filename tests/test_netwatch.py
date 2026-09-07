@@ -21,6 +21,7 @@ from netwatch import (  # noqa: E402
     decode_hex_ip,
     decode_hex_port,
     find_unusual,
+    EXPLAIN_TEXT,
     format_table,
     get_connections,
     is_established,
@@ -644,6 +645,117 @@ class TestL8RaggedRows(unittest.TestCase):
         self.assertIn("only", out)
         self.assertNotIn("EXTRA_CELL", out)
         self.assertEqual(len(out.splitlines()), 6)  # header, sep, 4 data rows
+
+
+class TestL2AttributionLanguage(unittest.TestCase):
+    """Backlog L2: attribution wording must not exceed collected evidence.
+
+    A missing inode join is 'unattributed' / 'process attribution
+    unavailable'. It does not establish another-user ownership, intent,
+    or a specific cause. Existing TestSummary assertions stay intact:
+    they already require the 'unknown owner' flag, not the causal clause.
+    """
+
+    def _unattributed_established(self) -> OwnedConnection:
+        return OwnedConnection(
+            make_conn(state="ESTABLISHED", local_ip="10.0.0.5",
+                      local_port=50000, remote_ip="93.184.216.34",
+                      remote_port=443, inode=2), [])
+
+    def test_unattributed_established_does_not_claim_another_user(self):
+        notes = find_unusual([self._unattributed_established()])
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        lowered = notes[0].lower()
+        self.assertNotIn("another user", lowered)
+        self.assertNotIn("likely belongs", lowered)
+
+    def test_unattributed_established_says_attribution_unavailable(self):
+        notes = find_unusual([self._unattributed_established()])
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        self.assertIn("process attribution unavailable", notes[0])
+        self.assertIn("10.0.0.5:50000", notes[0])
+        self.assertIn("93.184.216.34:443", notes[0])
+
+    def test_attributed_established_is_not_flagged(self):
+        rec = OwnedConnection(
+            make_conn(state="ESTABLISHED", local_ip="10.0.0.5",
+                      local_port=50000, remote_ip="93.184.216.34",
+                      remote_port=443, inode=2),
+            [SocketOwner(100, "web")])
+        self.assertEqual(find_unusual([rec]), [])
+
+    def test_time_wait_inode_zero_is_not_another_user(self):
+        rec = OwnedConnection(make_conn(state="TIME_WAIT", inode=0), [])
+        blob = "\n".join(find_unusual([rec])).lower()
+        self.assertNotIn("another user", blob)
+        self.assertNotIn("unknown owner", blob)
+
+    def test_unattributed_privileged_wildcard_uses_unattributed_label(self):
+        rec = OwnedConnection(
+            make_conn(state="LISTEN", local_ip="0.0.0.0", local_port=22,
+                      inode=1), [])
+        notes = find_unusual([rec])
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        self.assertIn("unattributed", notes[0])
+        self.assertNotIn("another user", notes[0].lower())
+
+    def test_unattributed_privileged_loopback_uses_unattributed_label(self):
+        rec = OwnedConnection(
+            make_conn(state="LISTEN", local_ip="127.0.0.1", local_port=631,
+                      inode=1), [])
+        notes = find_unusual([rec])
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        self.assertIn("unattributed", notes[0])
+        self.assertIn("loopback", notes[0])
+        self.assertNotIn("another user", notes[0].lower())
+
+    def test_unattributed_udp_does_not_claim_another_user(self):
+        rec = OwnedConnection(
+            make_conn(proto="udp", state="STATELESS", local_ip="0.0.0.0",
+                      local_port=53, inode=3), [])
+        notes = find_unusual([rec])
+        blob = "\n".join(notes).lower()
+        self.assertTrue(notes)
+        self.assertIn("unattributed", blob)
+        self.assertNotIn("another user", blob)
+
+    def test_successful_attribution_still_shows_pid_and_name(self):
+        rec = OwnedConnection(
+            make_conn(state="ESTABLISHED", local_ip="10.0.0.5",
+                      local_port=50000, remote_ip="1.2.3.4",
+                      remote_port=443, inode=9),
+            [SocketOwner(4242, "myapp")])
+        self.assertEqual(owner_label(rec.owners), "myapp [4242]")
+        out = render_processes([rec], 0)
+        self.assertIn("myapp [4242]", out)
+        self.assertNotIn("another user", out.lower())
+
+    def test_multiple_owners_are_listed_not_guessed(self):
+        rec = OwnedConnection(
+            make_conn(state="ESTABLISHED", local_ip="10.0.0.5",
+                      local_port=50000, remote_ip="1.2.3.4",
+                      remote_port=443, inode=9),
+            [SocketOwner(1, "a"), SocketOwner(2, "b")])
+        self.assertEqual(owner_label(rec.owners), "a [1], b [2]")
+        self.assertEqual(find_unusual([rec]), [])
+
+    def test_render_processes_does_not_invent_a_cause(self):
+        out = render_processes([self._unattributed_established()],
+                               unreadable_pids=4)
+        lowered = out.lower()
+        self.assertIn("unreadable", lowered)
+        self.assertIn("4", out)
+        self.assertNotIn("another user", lowered)
+        self.assertNotIn("without root", lowered)
+        self.assertNotIn("your own processes", lowered)
+
+    def test_explain_unattributed_is_not_identification(self):
+        collapsed = " ".join(EXPLAIN_TEXT.lower().split())
+        self.assertIn("unattributed", collapsed)
+        self.assertIn(
+            "does not identify the owner or the reason attribution failed",
+            collapsed,
+        )
 
 
 if __name__ == "__main__":

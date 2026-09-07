@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -495,8 +495,8 @@ def render_processes(records: list[OwnedConnection], unreadable_pids: int) -> st
     if unattributed or unreadable_pids:
         out.append(
             f"{unreadable_pids} process fd directory(ies) were unreadable. "
-            "This is normal without root: you can only inspect file "
-            "descriptors of your own processes (see `netwatch explain`)."
+            "Unreadability does not identify a socket owner "
+            "(see `netwatch explain`)."
         )
     return "\n".join(out)
 
@@ -569,7 +569,7 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
                 f"established connection with unknown owner: "
                 f"{endpoint(conn.local_ip, conn.local_port)} -> "
                 f"{endpoint(conn.remote_ip, conn.remote_port)} - "
-                "likely belongs to another user's process."
+                "process attribution unavailable."
             )
     time_wait = sum(1 for r in records if r.connection.state == "TIME_WAIT")
     if time_wait > 20:
@@ -716,7 +716,9 @@ WHY UNPRIVILEGED PROCESSES CANNOT ALWAYS IDENTIFY SOCKET OWNERS
   own socket tables, so a host-wide read may not see (or may misattribute)
   container sockets; and some systems mount /proc with hidepid=2, which
   hides other users' processes entirely. That is why netwatch reports
-  "unattributed" counts instead of guessing.
+  "unattributed" counts instead of guessing. Unattributed means no
+  matching readable fd was found; it does not identify the owner or
+  the reason attribution failed.
 """
 
 

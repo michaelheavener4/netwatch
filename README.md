@@ -161,7 +161,9 @@ record remains, so they can never be attributed.
   privileged-port fact.
 - **Attribution gaps without root.** Expect root-owned service sockets
   (port 22, 53, 631, DHCP, …) to show as unattributed when run as a normal
-  user. That is the permission model working, not a bug.
+  user. That is the permission model working, not a bug. Unattributed
+  means no matching readable `/proc/<pid>/fd` was found; it does not
+  establish that the socket belongs to another user.
 - **Positional parsing has one undetectable edge.** Column shapes are
   validated and format drift produces warnings, but the socket tables carry
   no version marker: a purely *numeric* column inserted before `uid` would
