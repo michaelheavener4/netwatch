@@ -19,11 +19,12 @@ import collections
 import ipaddress
 import os
 import re
+import signal
 import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -51,10 +52,40 @@ PROC_NET_FILES: tuple[tuple[str, str], ...] = (
 )
 
 _SOCKET_RE = re.compile(r"^socket:\[(\d+)\]$")
+# Shape anchors for positional /proc/net/* columns. The socket tables carry
+# no version marker, so a kernel (or patch) inserting a column before `uid`
+# would otherwise shift uid/inode silently. These anchors convert every
+# *detectable* drift into a skipped line (which is then reported); a purely
+# numeric insertion is byte-identical to a genuine row (e.g. a TIME_WAIT
+# record) and remains undetectable in principle - see README limitations.
+_SLOT_RE = re.compile(r"^\d+:$")                    # "0:"
+_QUEUE_RE = re.compile(r"^[0-9A-Fa-f]+:[0-9A-Fa-f]+$")  # "00000000:00000000"
+_HEX_RE = re.compile(r"^[0-9A-Fa-f]+$")             # retrnsmt counter
 
 
 class NetwatchError(Exception):
     """Fatal, user-facing netwatch error."""
+
+
+# Conventional Unix exit status for death by SIGPIPE (128 + 13).
+_SIGPIPE_STATUS = 141
+
+
+def restore_sigpipe() -> None:
+    """Restore default SIGPIPE handling.
+
+    Python sets SIGPIPE to SIG_IGN at startup, which turns a closed output
+    pipe (`netwatch summary | head`) into a BrokenPipeError traceback and a
+    bogus exit code. Restoring SIG_DFL makes the process die silently by
+    signal like any well-behaved Unix tool.
+    """
+    sigpipe = getattr(signal, "SIGPIPE", None)
+    if sigpipe is None:
+        return
+    try:
+        signal.signal(sigpipe, signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
 
 
 @dataclass
@@ -130,8 +161,11 @@ def parse_proc_net_line(line: str, proto: str) -> Connection | None:
     parts = line.split()
     if len(parts) < 10:
         return None
-    if parts[0] == "sl" or not parts[0].endswith(":"):
+    if parts[0] == "sl" or not _SLOT_RE.match(parts[0]):
         return None  # header line or garbage
+    if not (_QUEUE_RE.match(parts[4]) and _QUEUE_RE.match(parts[5])
+            and _HEX_RE.match(parts[6])):
+        return None  # column drift: refuse to guess uid/inode positions
     try:
         local_ip, local_port = split_address(parts[1])
         remote_ip, remote_port = split_address(parts[2])
@@ -159,19 +193,27 @@ def parse_proc_net_line(line: str, proto: str) -> Connection | None:
 
 
 def read_proc_net_file(path: str, proto: str) -> tuple[list[Connection], int]:
-    """Read one /proc/net/* file. Returns (connections, skipped_lines)."""
+    """Read one /proc/net/* file.
+
+    Returns (connections, malformed_lines). The header line is skipped
+    silently; any other unparsable data line is counted so callers can
+    report format drift instead of hiding it.
+    """
     connections: list[Connection] = []
-    skipped = 0
+    malformed = 0
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if not line.strip():
+            parts = line.split()
+            if not parts:
                 continue
+            if parts[0] == "sl":
+                continue  # header, not data
             conn = parse_proc_net_line(line, proto)
             if conn is None:
-                skipped += 1
+                malformed += 1
             else:
                 connections.append(conn)
-    return connections, skipped
+    return connections, malformed
 
 
 def get_connections(proc_root: str = DEFAULT_PROC_ROOT) -> tuple[list[Connection], list[str]]:
@@ -186,7 +228,7 @@ def get_connections(proc_root: str = DEFAULT_PROC_ROOT) -> tuple[list[Connection
     for filename, proto in PROC_NET_FILES:
         path = os.path.join(proc_root, "net", filename)
         try:
-            conns, _skipped = read_proc_net_file(path, proto)
+            conns, malformed = read_proc_net_file(path, proto)
         except FileNotFoundError:
             warnings.append(f"{path} not present; skipping {proto}.")
             continue
@@ -194,6 +236,11 @@ def get_connections(proc_root: str = DEFAULT_PROC_ROOT) -> tuple[list[Connection
             warnings.append(f"could not read {path}: {exc}; skipping {proto}.")
             continue
         read_any = True
+        if malformed:
+            warnings.append(
+                f"skipped {malformed} malformed line(s) in {path}; "
+                f"the kernel's {proto} table format may have changed."
+            )
         connections.extend(conns)
     if not read_any:
         raise NetwatchError(
@@ -207,6 +254,24 @@ def get_connections(proc_root: str = DEFAULT_PROC_ROOT) -> tuple[list[Connection
 # Socket -> process attribution via /proc/<pid>/fd
 # ---------------------------------------------------------------------------
 
+_UNSAFE_NAME_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_MAX_NAME_LEN = 32
+
+
+def clean_process_name(name: str) -> str:
+    """Neutralize a kernel-reported process name for safe terminal display.
+
+    comm/cmdline content is attacker-influenced: any local process can set
+    it, including embedded newlines (table-row forgery) and ANSI escapes
+    (terminal manipulation). Replace C0/C1 controls, collapse all
+    whitespace runs to single spaces, and truncate: content is preserved,
+    control is not.
+    """
+    cleaned = _UNSAFE_NAME_RE.sub("?", name)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:_MAX_NAME_LEN] or "?"
+
+
 def process_name(proc_root: str, pid: int) -> str:
     """Best-effort process name: /proc/<pid>/comm, else cmdline, else pid."""
     try:
@@ -214,7 +279,7 @@ def process_name(proc_root: str, pid: int) -> str:
                   "r", encoding="utf-8", errors="replace") as handle:
             name = handle.read().strip()
         if name:
-            return name
+            return clean_process_name(name)
     except OSError:
         pass
     try:
@@ -222,7 +287,7 @@ def process_name(proc_root: str, pid: int) -> str:
                   "rb") as handle:
             first = handle.read().split(b"\0")[0].decode("utf-8", "replace").strip()
         if first:
-            return os.path.basename(first)
+            return clean_process_name(os.path.basename(first))
     except OSError:
         pass
     return f"pid {pid}"
@@ -307,6 +372,16 @@ def _ip_kind(ip: str) -> str:
 
 def is_listening(conn: Connection) -> bool:
     return conn.state == "LISTEN"
+
+
+def is_service(conn: Connection) -> bool:
+    """True for sockets that represent a locally reachable service.
+
+    TCP listeners, plus UDP endpoints: UDP has no listen state, so any
+    UDP row is a local port able to receive datagrams and must be treated
+    as a service for visibility and heuristics.
+    """
+    return is_listening(conn) or conn.proto.startswith("udp")
 
 
 def is_established(conn: Connection) -> bool:
@@ -426,7 +501,8 @@ class Summary:
     total: int
     by_proto: dict[str, int]
     by_state: dict[str, int]
-    listening: list[Connection]
+    listening: list[Connection]      # TCP listeners
+    udp_services: list[Connection]   # UDP endpoints (no listen state exists)
     established: list[OwnedConnection]
     processes: list[str]
     unattributed: int
@@ -439,15 +515,19 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
     for rec in records:
         conn = rec.connection
         who = owner_label(rec.owners)
-        if is_listening(conn) and _ip_kind(conn.local_ip) == "wildcard":
+        if is_service(conn) and _ip_kind(conn.local_ip) == "wildcard":
+            kind = ("listening on" if is_listening(conn)
+                    else "UDP service on")
             notes.append(
-                f"listening on all interfaces: {conn.proto} "
+                f"{kind} all interfaces: {conn.proto} "
                 f"{endpoint(conn.local_ip, conn.local_port)} ({who}) - "
                 "reachable from the network, not just localhost."
             )
-        if is_listening(conn) and conn.local_port < 1024:
+        if is_service(conn) and conn.local_port < 1024:
+            kind = ("privileged port listening (<1024)" if is_listening(conn)
+                    else "privileged UDP port (<1024)")
             notes.append(
-                f"privileged port listening (<1024): {conn.proto} "
+                f"{kind}: {conn.proto} "
                 f"{endpoint(conn.local_ip, conn.local_port)} ({who}) - "
                 "only a privileged process (or one granted the capability) "
                 "can bind here; check that you expect this service."
@@ -473,6 +553,8 @@ def build_summary(records: list[OwnedConnection]) -> Summary:
     by_proto: dict[str, int] = dict(collections.Counter(r.connection.proto for r in records))
     by_state: dict[str, int] = dict(collections.Counter(r.connection.state for r in records))
     listening = [r.connection for r in records if is_listening(r.connection)]
+    udp_services = [r.connection for r in records
+                    if r.connection.proto.startswith("udp")]
     established = [r for r in records if r.connection.state == "ESTABLISHED"]
     processes = sorted({o.name for r in records for o in r.owners})
     unattributed = sum(1 for r in records if not r.owners)
@@ -481,6 +563,7 @@ def build_summary(records: list[OwnedConnection]) -> Summary:
         by_proto=by_proto,
         by_state=by_state,
         listening=listening,
+        udp_services=udp_services,
         established=established,
         processes=processes,
         unattributed=unattributed,
@@ -496,12 +579,22 @@ def render_summary(summary: Summary) -> str:
     out.append("Counts by state:")
     for state in sorted(summary.by_state):
         out.append(f"  {state}: {summary.by_state[state]}")
-    out.append(f"\nListening ports ({len(summary.listening)}):")
+    out.append(f"\nListening ports - TCP only ({len(summary.listening)}):")
     if summary.listening:
         out.append(format_table(
             ["PROTO", "LOCAL", "UID", "INODE"],
             [[c.proto, endpoint(c.local_ip, c.local_port),
               str(c.uid), str(c.inode)] for c in summary.listening],
+        ))
+    else:
+        out.append("  (none)")
+    out.append(f"\nUDP services - connectionless, no listen state "
+               f"({len(summary.udp_services)}):")
+    if summary.udp_services:
+        out.append(format_table(
+            ["PROTO", "LOCAL", "UID", "INODE"],
+            [[c.proto, endpoint(c.local_ip, c.local_port),
+              str(c.uid), str(c.inode)] for c in summary.udp_services],
         ))
     else:
         out.append("  (none)")
@@ -672,22 +765,32 @@ def cmd_summary(proc_root: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    restore_sigpipe()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.version:
         print(f"netwatch {VERSION}")
-        return 0
-    if args.command == "connections":
-        return cmd_connections(args.proc_root)
-    if args.command == "processes":
-        return cmd_processes(args.proc_root)
-    if args.command == "summary":
-        return cmd_summary(args.proc_root)
-    if args.command == "explain":
+        code = 0
+    elif args.command == "connections":
+        code = cmd_connections(args.proc_root)
+    elif args.command == "processes":
+        code = cmd_processes(args.proc_root)
+    elif args.command == "summary":
+        code = cmd_summary(args.proc_root)
+    elif args.command == "explain":
         print(EXPLAIN_TEXT)
-        return 0
-    parser.print_help()
-    return 0
+        code = 0
+    else:
+        parser.print_help()
+        code = 0
+    try:
+        # Flush here, inside the guarded region: with SIG_DFL restored, a
+        # closed pipe kills us by signal (status 141, silent). The except
+        # below is only a backstop for platforms without SIGPIPE.
+        sys.stdout.flush()
+    except BrokenPipeError:
+        return _SIGPIPE_STATUS
+    return code
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 
 import io
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +28,7 @@ from netwatch import (  # noqa: E402
     main,
     owner_label,
     parse_proc_net_line,
+    render_processes,
     split_address,
 )
 
@@ -396,6 +399,133 @@ class TestCli(unittest.TestCase, FakeProcMixin):
             with redirect_stdout(buf):
                 code = main(["--proc-root", tmp, "summary"])
             self.assertEqual(code, 1)
+
+
+class TestAdversarial(unittest.TestCase):
+    """Hostile-review regression tests (H1, M1, M2, M3).
+
+    Each test in this class fails against netwatch v0.1.0 and passes only
+    after the corresponding fix. They must never be weakened to make a
+    future change pass.
+    """
+
+    NETWATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    IPV4_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr "
+                   "tm->when retrnsmt   uid  timeout inode\n")
+
+    def _make_proc_root(self, net_files, pids=()):
+        """Build a fake /proc tree. net_files maps filename->data lines
+        (headers added automatically); pids maps pid->(comm_bytes|None,
+        cmdline_bytes|None, [fd targets])."""
+        tmp = tempfile.mkdtemp()
+        net = os.path.join(tmp, "net")
+        os.mkdir(net)
+        for name in ("tcp", "tcp6", "udp", "udp6"):
+            with open(os.path.join(net, name), "w") as handle:
+                handle.write(self.IPV4_HEADER)
+                for line in net_files.get(name, []):
+                    handle.write(line)
+        for pid, comm, cmdline, targets in pids:
+            pdir = os.path.join(tmp, pid, "fd")
+            os.makedirs(pdir)
+            if comm is not None:
+                with open(os.path.join(tmp, pid, "comm"), "wb") as handle:
+                    handle.write(comm)
+            if cmdline is not None:
+                with open(os.path.join(tmp, pid, "cmdline"), "wb") as handle:
+                    handle.write(cmdline)
+            for i, target in enumerate(targets):
+                os.symlink(target, os.path.join(pdir, str(i)))
+        return tmp
+
+    # -- H1: UDP services must be visible and flagged ---------------------
+    def test_udp_wildcard_service_is_surfaced(self):
+        tmp = self._make_proc_root({
+            "udp": ["  10: 00000000:0035 00000000:0000 07 00000000:00000000 "
+                    "00:00000000 00000000     0        0 5555\n"],
+        })
+        conns, warnings = get_connections(tmp)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(conns), 1)
+        summary = build_summary(attribute_owners(conns, {}))
+        # The UDP service must appear as a service, not vanish into counts.
+        self.assertEqual(len(summary.udp_services), 1)
+        self.assertEqual(summary.udp_services[0].local_port, 53)
+        # ... and the wildcard exposure must be flagged.
+        notes = [n for n in summary.unusual if "udp" in n.lower()]
+        self.assertTrue(notes, "UDP wildcard service produced no note")
+        self.assertTrue(any("53" in n and "all interfaces" in n for n in notes))
+
+    # -- M1: hostile process names must not forge output ------------------
+    def test_hostile_process_name_cannot_forge_rows(self):
+        hostile_comm = b"evil\nFORGED 9.9.9.9:1 x\n\x1b[2J"
+        hostile_cmd = b"/usr/bin/evil\nprog\x1b[31m\x00--flag\x00"
+        long_cmd = b"/usr/bin/" + b"A" * 200 + b"\x00"
+        tmp = self._make_proc_root(
+            {"tcp": ["   0: 00000000:0016 00000000:0000 0A 00000000:00000000 "
+                     "00:00000000 00000000     0        0 777\n"]},
+            pids=[("1234", hostile_comm, None, ["socket:[777]"]),
+                  ("5678", None, hostile_cmd, ["socket:[777]"]),
+                  ("9012", None, long_cmd, ["socket:[777]"])],
+        )
+        inode_map, _ = build_inode_map(tmp)
+        names = [o.name for o in inode_map[777]]
+        self.assertEqual(len(names), 3)
+        for name in names:
+            self.assertNotIn("\n", name)
+            self.assertNotIn("\x1b", name)
+            self.assertLessEqual(len(name), 32)
+        self.assertTrue(any("FORGED" in n for n in names),
+                        "legitimate content should survive, neutralized")
+        conns, _ = get_connections(tmp)
+        out = render_processes(attribute_owners(conns, inode_map), 0)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\nFORGED", out)
+
+    # -- M2: corrupt columns must not silently misparse -------------------
+    def test_garbage_queue_column_is_rejected(self):
+        good = ("   0: 00000000:0016 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000     0        0 10807\n")
+        bad = good.replace("00000000:00000000", "ZZZ", 1)
+        self.assertIsNotNone(parse_proc_net_line(good, "tcp"))
+        self.assertIsNone(parse_proc_net_line(bad, "tcp"),
+                          "line with corrupt queue column must be skipped, "
+                          "not parsed")
+
+    def test_malformed_lines_produce_a_warning(self):
+        tmp = self._make_proc_root({
+            "tcp": ["   0: 00000000:0016 00000000:0000 0A 00000000:00000000 "
+                    "00:00000000 00000000     0        0 10807\n",
+                    "   1: 00000000:0017 00000000:0000 0A 00000000:00000000 "
+                    "00:00000000 00000000     0        0 notanumber\n"],
+        })
+        conns, warnings = get_connections(tmp)
+        self.assertEqual(len(conns), 1)
+        self.assertTrue(any("malformed" in w for w in warnings),
+                        f"format drift must be visible; got: {warnings}")
+
+    def test_tcp6_data_line_parses(self):
+        line = ("   0: 00000000000000000000000001000000:0016 "
+                "00000000000000000000000000000000:0000 0A "
+                "00000000:00000000 00:00000000 00000000     0        0 10809")
+        conn = parse_proc_net_line(line, "tcp6")
+        self.assertIsNotNone(conn)
+        assert conn is not None
+        self.assertEqual((conn.local_ip, conn.local_port), ("::1", 22))
+        self.assertEqual(conn.state, "LISTEN")
+
+    # -- M3: dying on a closed pipe must be silent and conventional -------
+    def test_broken_pipe_dies_by_sigpipe(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)  # no reader will ever exist: first write must fail
+        try:
+            proc = subprocess.Popen(
+                [sys.executable,
+                 os.path.join(self.NETWATCH_DIR, "netwatch.py"), "explain"],
+                stdout=write_fd, stderr=subprocess.DEVNULL)
+        finally:
+            os.close(write_fd)
+        self.assertEqual(proc.wait(), -signal.SIGPIPE)
 
 
 if __name__ == "__main__":

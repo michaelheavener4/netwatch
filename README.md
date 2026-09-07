@@ -11,7 +11,7 @@ no scanning of other machines.
 Requires Python 3.12+ on Linux. No dependencies to install.
 
 ```bash
-git clone <this-repo>   # or copy the netwatch/ directory
+git clone https://github.com/michaelheavener4/netwatch
 cd netwatch
 ./netwatch.py --help
 ```
@@ -39,9 +39,11 @@ netwatch explain       # teach the concepts (TCP states, /proc, inodes, ...)
 ```
 
 `netwatch` with no subcommand prints help. Exit code is `0` on success,
-`1` if the socket tables cannot be read at all (e.g. not on Linux).
-Unreadable processes or missing table files produce warnings on stderr,
-never a crash.
+`1` if the socket tables cannot be read at all (e.g. not on Linux), and
+`141` if the output pipe closes early (standard SIGPIPE behavior, so
+`netwatch summary | head` dies silently instead of printing a traceback).
+Unreadable processes, missing table files, or malformed table lines produce
+warnings on stderr, never a crash.
 
 Example (abridged):
 
@@ -63,7 +65,7 @@ Anything unusual (local heuristics only - prompts, not verdicts):
 
 ## Architecture
 
-One file, deliberately: `netwatch.py` (~600 lines). The pipeline is linear
+One file, deliberately: `netwatch.py` (~700 lines). The pipeline is linear
 and each stage is independently testable:
 
 ```
@@ -81,6 +83,9 @@ Key functions:
 | `parse_proc_net_line` | One `/proc/net/*` line → `Connection` (or `None`) |
 | `get_connections` | Read all four socket tables; warn-and-skip on failure |
 | `build_inode_map` | Scan every process's fd symlinks for `socket:[inode]` |
+| `clean_process_name` | Strip control characters / escapes from process names |
+| `is_service` | TCP listeners plus UDP endpoints (both are exposable services) |
+| `restore_sigpipe` | Die silently by signal when the output pipe closes early |
 | `attribute_owners` | Join connections to owners on the inode number |
 | `build_summary` / `find_unusual` | Pure functions: counts, groups, local-only heuristics |
 | `render_*` / `format_table` | Plain-text tables, no dependencies |
@@ -128,7 +133,11 @@ processes entirely. Run `netwatch explain` for the full story.
 handshake → ESTABLISHED → goodbye handshake → TIME_WAIT), and the kernel
 reports it. UDP is connectionless — a row is just a local port that sent or
 received datagrams — so the kernel's state column is meaningless there and
-netwatch displays `STATELESS`. Similarly, `TIME_WAIT` rows report inode `0`
+netwatch displays `STATELESS`. Because there is no listen state, every UDP
+row is treated as a *service*: `summary` lists them in their own "UDP
+services" section (separate from TCP "Listening ports") and the
+wildcard/privileged-port heuristics apply to them too. Similarly,
+`TIME_WAIT` rows report inode `0`
 because the socket itself is already gone; only the kernel's bookkeeping
 record remains, so they can never be attributed.
 
@@ -149,6 +158,12 @@ record remains, so they can never be attributed.
 - **Attribution gaps without root.** Expect root-owned service sockets
   (port 22, 53, 631, DHCP, …) to show as unattributed when run as a normal
   user. That is the permission model working, not a bug.
+- **Positional parsing has one undetectable edge.** Column shapes are
+  validated and format drift produces warnings, but the socket tables carry
+  no version marker: a purely *numeric* column inserted before `uid` would
+  be byte-identical to a genuine row and cannot be distinguished in
+  principle. Anything detectable is rejected; this residual is documented,
+  not fixable, without kernel cooperation.
 
 ## Security considerations
 
@@ -157,21 +172,28 @@ record remains, so they can never be attributed.
   socket, never executes another program, never sends data anywhere. The
   worst it can do is print something surprising.
 - **Input is untrusted-shaped but local.** Process names come from
-  `/proc/<pid>/comm` (or `cmdline` as fallback) and are printed as-is; a
-  hostile local process could embed terminal escape sequences or misleading
-  names in them. netwatch does not sanitize these — do not pipe its output
-  into a shell, and treat process names as claims, not proof. (Same caveat
-  applies to `ps`.)
+  `/proc/<pid>/comm` (or `cmdline` as fallback) and any local process can
+  set them — including embedded newlines (table-row forgery) and ANSI
+  escapes (terminal manipulation). netwatch neutralizes this at the trust
+  boundary in `clean_process_name()`: C0/C1 control characters become `?`,
+  all whitespace runs collapse to single spaces, and names truncate at 32
+  characters. Legitimate content survives; control does not. Still treat
+  process names as claims, not proof — sanitizing display is not
+  authentication (same caveat applies to `ps`).
 - **No privilege escalation path.** It does not need setuid, sudo, or
   capabilities, and must never be given them — extra privilege would only
   widen what a bug could touch, for no functional gain.
 - **Privacy of output.** Connection lists reveal browsing endpoints, local
   network layout (VPN/Tailscale addresses), and running services. Fine to
   study locally; think before pasting full output into a public forum.
-- **Denial-of-service resistance.** All parsing is bounded line-by-line
-  string work; malformed `/proc` lines are skipped, per-PID and per-fd
-  errors are caught individually so one vanishing process cannot abort a
-  scan. There is no recursion and no unbounded allocation keyed on input.
+- **Denial-of-service resistance.** Table parsing is streaming and
+  line-by-line; corrupt columns are rejected by shape anchors and
+  malformed lines are counted and reported as warnings (format drift stays
+  visible). Per-PID and per-fd errors are caught individually so one
+  vanishing process cannot abort a scan. There is no recursion. Cost scales
+  with the number of sockets and file descriptors scanned — same as `ss` —
+  which a hostile local user could inflate, but the only victim is the
+  tool's own runtime.
 
 ## Second-iteration ideas
 
