@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -374,14 +374,31 @@ def is_listening(conn: Connection) -> bool:
     return conn.state == "LISTEN"
 
 
-def is_service(conn: Connection) -> bool:
-    """True for sockets that represent a locally reachable service.
+def _remote_is_zero(conn: Connection) -> bool:
+    """True when the remote endpoint is unspecified/zero (0.0.0.0:0 or [::]:0)."""
+    if conn.remote_port != 0 or not _is_ip(conn.remote_ip):
+        return False
+    return ipaddress.ip_address(conn.remote_ip).is_unspecified
 
-    TCP listeners, plus UDP endpoints: UDP has no listen state, so any
-    UDP row is a local port able to receive datagrams and must be treated
-    as a service for visibility and heuristics.
+
+def is_peerless_udp(conn: Connection) -> bool:
+    """UDP with no concrete remote: a listener candidate, not a proven service."""
+    return conn.proto.startswith("udp") and _remote_is_zero(conn)
+
+
+def is_peered_udp(conn: Connection) -> bool:
+    """UDP with a concrete remote. Direction (client/server) is not established."""
+    return conn.proto.startswith("udp") and not _remote_is_zero(conn)
+
+
+def is_service(conn: Connection) -> bool:
+    """TCP listeners, plus peerless UDP (listener candidates).
+
+    UDP has no LISTEN state. A zero remote (0.0.0.0:0 / [::]:0) is a
+    listener candidate; a concrete peer is not a service and does not
+    establish inbound reachability.
     """
-    return is_listening(conn) or conn.proto.startswith("udp")
+    return is_listening(conn) or is_peerless_udp(conn)
 
 
 def is_established(conn: Connection) -> bool:
@@ -507,7 +524,8 @@ class Summary:
     by_proto: dict[str, int]
     by_state: dict[str, int]
     listening: list[Connection]      # TCP listeners
-    udp_services: list[Connection]   # UDP endpoints (no listen state exists)
+    udp_services: list[Connection]   # peerless UDP (listener candidates)
+    udp_peered: list[Connection]     # UDP with a concrete remote
     established: list[OwnedConnection]
     processes: list[str]
     unattributed: int
@@ -530,7 +548,7 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
             exposure = _ip_kind(conn.local_ip)
             privileged = conn.local_port < 1024
             service = ("listening on" if is_listening(conn)
-                       else "UDP service on")
+                       else "UDP listener candidate on")
             where = endpoint(conn.local_ip, conn.local_port)
             if exposure == "wildcard" and privileged:
                 notes.append(
@@ -583,7 +601,9 @@ def build_summary(records: list[OwnedConnection]) -> Summary:
     by_state: dict[str, int] = dict(collections.Counter(r.connection.state for r in records))
     listening = [r.connection for r in records if is_listening(r.connection)]
     udp_services = [r.connection for r in records
-                    if r.connection.proto.startswith("udp")]
+                    if is_peerless_udp(r.connection)]
+    udp_peered = [r.connection for r in records
+                  if is_peered_udp(r.connection)]
     established = [r for r in records if r.connection.state == "ESTABLISHED"]
     processes = sorted({o.name for r in records for o in r.owners})
     unattributed = sum(1 for r in records if not r.owners)
@@ -593,6 +613,7 @@ def build_summary(records: list[OwnedConnection]) -> Summary:
         by_state=by_state,
         listening=listening,
         udp_services=udp_services,
+        udp_peered=udp_peered,
         established=established,
         processes=processes,
         unattributed=unattributed,
@@ -617,13 +638,24 @@ def render_summary(summary: Summary) -> str:
         ))
     else:
         out.append("  (none)")
-    out.append(f"\nUDP services - connectionless, no listen state "
+    out.append(f"\nUDP listener candidates - peerless, no listen state "
                f"({len(summary.udp_services)}):")
     if summary.udp_services:
         out.append(format_table(
             ["PROTO", "LOCAL", "UID", "INODE"],
             [[c.proto, endpoint(c.local_ip, c.local_port),
               str(c.uid), str(c.inode)] for c in summary.udp_services],
+        ))
+    else:
+        out.append("  (none)")
+    out.append(f"\nPeered UDP endpoints - concrete remote, direction unknown "
+               f"({len(summary.udp_peered)}):")
+    if summary.udp_peered:
+        out.append(format_table(
+            ["PROTO", "LOCAL", "REMOTE", "UID", "INODE"],
+            [[c.proto, endpoint(c.local_ip, c.local_port),
+              endpoint(c.remote_ip, c.remote_port),
+              str(c.uid), str(c.inode)] for c in summary.udp_peered],
         ))
     else:
         out.append("  (none)")
@@ -684,8 +716,10 @@ TCP STATES (the important ones)
                usually harmless.
   CLOSE        No real connection (often what UDP rows would map to).
   UDP has no states at all - it is connectionless, so netwatch shows
-  "STATELESS" for UDP rows: each row is just a local port that received or
-  sent datagrams.
+  "STATELESS" for UDP rows. A zero remote (0.0.0.0:0 or [::]:0) is a
+  listener candidate, not proof the application accepts datagrams. A
+  concrete remote is a peered endpoint; /proc does not establish
+  direction (client vs server, inbound vs outbound).
 
 /proc/net/tcp (and tcp6, udp, udp6)
   These are plain-text tables published by the kernel. Each line is one

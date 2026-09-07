@@ -26,10 +26,13 @@ from netwatch import (  # noqa: E402
     get_connections,
     is_established,
     is_listening,
+    is_service,
     main,
     owner_label,
     parse_proc_net_line,
+    render_connections,
     render_processes,
+    render_summary,
     split_address,
 )
 
@@ -826,6 +829,113 @@ class TestF1PrivilegedPortEvidence(unittest.TestCase):
         lowered = notes[0].lower()
         self.assertNotIn("privileged", lowered)
         self.assertNotIn("can bind here", lowered)
+
+
+class TestF2UdpPeerSemantics(unittest.TestCase):
+    """Muse F2: peered UDP is not a service / listener candidate.
+
+    /proc/net/udp has no LISTEN state. A zero remote (0.0.0.0:0 or [::]:0)
+    is a listener candidate; a concrete peer is a peered endpoint whose
+    direction is unknown. Existing H1/L1 UDP tests use peerless remotes
+    and stay intact.
+    """
+
+    def _peered(self, **kwargs) -> Connection:
+        defaults = dict(
+            proto="udp", state="STATELESS",
+            local_ip="0.0.0.0", local_port=45056,
+            remote_ip="8.8.8.8", remote_port=53, inode=9,
+        )
+        defaults.update(kwargs)
+        return make_conn(**defaults)
+
+    def _peerless(self, **kwargs) -> Connection:
+        defaults = dict(
+            proto="udp", state="STATELESS",
+            local_ip="0.0.0.0", local_port=5353,
+            remote_ip="0.0.0.0", remote_port=0, inode=8,
+        )
+        defaults.update(kwargs)
+        return make_conn(**defaults)
+
+    def _notes(self, conn: Connection) -> list[str]:
+        return find_unusual([OwnedConnection(conn, [])])
+
+    def test_a_peered_udp_is_not_a_service(self):
+        conn = self._peered()
+        self.assertFalse(is_service(conn))
+        notes = self._notes(conn)
+        blob = "\n".join(notes).lower()
+        self.assertFalse(notes)
+        self.assertNotIn("udp service on", blob)
+        self.assertNotIn("reachable from the network", blob)
+        out = render_connections([conn])
+        self.assertIn("45056", out)
+        self.assertIn("8.8.8.8:53", out)
+
+    def test_b_peerless_wildcard_udp_remains_listener_candidate(self):
+        conn = self._peerless()
+        self.assertTrue(is_service(conn))
+        notes = self._notes(conn)
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        self.assertIn("all interfaces", notes[0])
+        self.assertIn("5353", notes[0])
+        self.assertIn("udp", notes[0].lower())
+
+    def test_c_peerless_loopback_udp_is_not_network_reachable(self):
+        conn = self._peerless(local_ip="127.0.0.1")
+        self.assertTrue(is_service(conn),
+                        "peerless loopback UDP is still a listener candidate")
+        notes = self._notes(conn)
+        blob = "\n".join(notes).lower()
+        self.assertNotIn("reachable from the network", blob)
+        self.assertNotIn("all interfaces", blob)
+
+    def test_d_summary_distinguishes_peerless_from_peered_udp(self):
+        peerless = self._peerless()
+        peered = self._peered()
+        tcp = make_conn(state="LISTEN", local_ip="0.0.0.0", local_port=22,
+                        inode=1)
+        summary = build_summary([
+            OwnedConnection(peerless, []),
+            OwnedConnection(peered, []),
+            OwnedConnection(tcp, [SocketOwner(1, "sshd")]),
+        ])
+        self.assertEqual(len(summary.listening), 1)
+        self.assertEqual([c.local_port for c in summary.udp_services], [5353])
+        self.assertNotIn(peered.local_port,
+                         [c.local_port for c in summary.udp_services])
+        self.assertEqual([c.local_port for c in summary.udp_peered], [45056])
+        self.assertEqual(summary.udp_peered[0].remote_ip, "8.8.8.8")
+        rendered = render_summary(summary)
+        self.assertNotIn("UDP services", rendered)
+        self.assertIn("listener candidate", rendered.lower())
+        self.assertIn("8.8.8.8", rendered)
+
+    def test_e_peered_udp_specific_local_is_not_a_service(self):
+        conn = self._peered(local_ip="192.168.1.10")
+        self.assertFalse(is_service(conn))
+        notes = self._notes(conn)
+        blob = "\n".join(notes).lower()
+        self.assertNotIn("udp service on", blob)
+        self.assertNotIn("reachable from the network", blob)
+        summary = build_summary([OwnedConnection(conn, [])])
+        self.assertEqual(summary.udp_services, [])
+        self.assertEqual(len(summary.udp_peered), 1)
+
+    def test_ipv6_peerless_unspecified_is_listener_candidate(self):
+        conn = self._peerless(proto="udp6", local_ip="::", remote_ip="::")
+        self.assertTrue(is_service(conn))
+        notes = self._notes(conn)
+        self.assertTrue(any("all interfaces" in n for n in notes))
+
+    def test_ipv6_peered_udp_is_not_a_service(self):
+        conn = self._peered(proto="udp6", local_ip="::",
+                            remote_ip="2001:db8::1", remote_port=443)
+        self.assertFalse(is_service(conn))
+        blob = "\n".join(self._notes(conn)).lower()
+        self.assertNotIn("udp service on", blob)
+        self.assertNotIn("reachable from the network", blob)
 
 
 if __name__ == "__main__":

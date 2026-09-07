@@ -84,7 +84,7 @@ Key functions:
 | `get_connections` | Read all four socket tables; warn-and-skip on failure |
 | `build_inode_map` | Scan every process's fd symlinks for `socket:[inode]` |
 | `clean_process_name` | Strip control characters / escapes from process names |
-| `is_service` | TCP listeners plus UDP endpoints (both are exposable services) |
+| `is_service` | TCP listeners plus peerless UDP (listener candidates) |
 | `restore_sigpipe` | Die silently by signal when the output pipe closes early |
 | `attribute_owners` | Join connections to owners on the inode number |
 | `build_summary` / `find_unusual` | Pure functions: counts, groups, local-only heuristics |
@@ -133,10 +133,12 @@ processes entirely. Run `netwatch explain` for the full story.
 handshake → ESTABLISHED → goodbye handshake → TIME_WAIT), and the kernel
 reports it. UDP is connectionless — a row is just a local port that sent or
 received datagrams — so the kernel's state column is meaningless there and
-netwatch displays `STATELESS`. Because there is no listen state, every UDP
-row is treated as a *service*: `summary` lists them in their own "UDP
-services" section (separate from TCP "Listening ports") and the
-wildcard/privileged-port heuristics apply to them too. Similarly,
+netwatch displays `STATELESS`. A *peerless* UDP row (remote `0.0.0.0:0` or
+`[::]:0`) is a *listener candidate*: `summary` lists those separately from
+TCP "Listening ports" and the wildcard/privileged-port heuristics apply to
+them. A UDP row with a concrete remote is a *peered endpoint*; direction
+(client vs server, inbound vs outbound) is not established, so it is not
+treated as a service and is not flagged as network-reachable. Similarly,
 `TIME_WAIT` rows report inode `0`
 because the socket itself is already gone; only the kernel's bookkeeping
 record remains, so they can never be attributed.
