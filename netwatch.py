@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -578,6 +578,15 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
                     f"{kind}: {conn.proto} "
                     f"{where} ({who}) - "
                     "check that you expect this service."
+                )
+            elif exposure != "loopback":
+                # Non-loopback specific bind (LAN/bridge/link-local/public).
+                # /proc proves the address, not routing or firewall.
+                notes.append(
+                    f"{service} specific address: {conn.proto} "
+                    f"{where} ({who}) - may be reachable from hosts that "
+                    f"can route to this address; firewall/routing/interface "
+                    f"state not checked; check that you expect this binding."
                 )
         if conn.state == "ESTABLISHED" and not rec.owners:
             notes.append(

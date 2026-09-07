@@ -160,10 +160,12 @@ record remains, so they can never be attributed.
   produces at most one heuristic note (exposure and privilege are combined,
   not double-reported), and loopback-only privileged listeners are worded
   as less exposed than wildcard ones — while still preserving the
-  privileged-port fact. A port `<1024` is a conventional range label, not
-  proof that privilege or `CAP_NET_BIND_SERVICE` was required to bind
-  (`net.ipv4.ip_unprivileged_port_start` can be lowered; socket uid is
-  shown separately and may be non-root).
+  privileged-port fact. A non-loopback specific bind (LAN, bridge,
+  link-local, public) is flagged as a bind-address candidate; that is
+  not a reachability verdict. A port `<1024` is a conventional range
+  label, not proof that privilege or `CAP_NET_BIND_SERVICE` was required
+  to bind (`net.ipv4.ip_unprivileged_port_start` can be lowered; socket
+  uid is shown separately and may be non-root).
 - **Attribution gaps without root.** Expect root-owned service sockets
   (port 22, 53, 631, DHCP, …) to show as unattributed when run as a normal
   user. That is the permission model working, not a bug. Unattributed

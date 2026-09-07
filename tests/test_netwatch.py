@@ -938,5 +938,79 @@ class TestF2UdpPeerSemantics(unittest.TestCase):
         self.assertNotIn("reachable from the network", blob)
 
 
+class TestF3SpecificBindListener(unittest.TestCase):
+    """F3: non-loopback specific binds must not be silent next to wildcards.
+
+    /proc proves the bind address. It does not prove routing, firewall,
+    or interface state. Silence on LAN/bridge/link-local high-port
+    listeners, while warning wildcard, teaches 'no flag = less exposed'.
+    One note per socket (L1). Loopback high-port stays quiet. Privileged
+    specific binds keep their existing single privileged note.
+    """
+
+    def _notes(self, **kwargs) -> list[str]:
+        owners = kwargs.pop("owners", [SocketOwner(100, "app")])
+        return find_unusual([OwnedConnection(make_conn(**kwargs), owners)])
+
+    def _assert_specific_bind_note(self, notes: list[str], bound: str) -> None:
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        note = notes[0]
+        self.assertIn(bound, note)
+        self.assertIn("specific address", note)
+        self.assertNotIn("all interfaces", note)
+        lowered = note.lower()
+        self.assertNotIn("reachable from the network", lowered)
+        self.assertIn("may be reachable", lowered)
+        self.assertIn("not checked", lowered)
+
+    def test_lan_high_port_tcp_is_flagged(self):
+        notes = self._notes(state="LISTEN", local_ip="192.168.1.10",
+                            local_port=8000)
+        self._assert_specific_bind_note(notes, "192.168.1.10:8000")
+
+    def test_docker_bridge_high_port_tcp_is_flagged(self):
+        notes = self._notes(state="LISTEN", local_ip="172.17.0.1",
+                            local_port=8000)
+        self._assert_specific_bind_note(notes, "172.17.0.1:8000")
+
+    def test_link_local_ipv6_high_port_is_flagged(self):
+        notes = self._notes(state="LISTEN", proto="tcp6",
+                            local_ip="fe80::1", local_port=8000)
+        self._assert_specific_bind_note(notes, "[fe80::1]:8000")
+
+    def test_loopback_high_port_stays_quiet(self):
+        notes = self._notes(state="LISTEN", local_ip="127.0.0.1",
+                            local_port=8080)
+        self.assertEqual(notes, [])
+
+    def test_wildcard_high_port_unchanged(self):
+        notes = self._notes(state="LISTEN", local_ip="0.0.0.0",
+                            local_port=8000)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("all interfaces", notes[0])
+        self.assertNotIn("specific address", notes[0])
+
+    def test_privileged_specific_stays_one_privileged_note(self):
+        notes = self._notes(state="LISTEN", local_ip="172.17.0.1",
+                            local_port=53)
+        self.assertEqual(len(notes), 1, f"one socket, one note; got: {notes}")
+        self.assertIn("privileged", notes[0])
+        self.assertNotIn("all interfaces", notes[0])
+
+    def test_peerless_udp_specific_is_flagged(self):
+        notes = self._notes(
+            proto="udp", state="STATELESS",
+            local_ip="192.168.1.10", local_port=5353,
+            remote_ip="0.0.0.0", remote_port=0)
+        self._assert_specific_bind_note(notes, "192.168.1.10:5353")
+
+    def test_peered_udp_specific_stays_unflagged(self):
+        notes = self._notes(
+            proto="udp", state="STATELESS",
+            local_ip="192.168.1.10", local_port=45056,
+            remote_ip="8.8.8.8", remote_port=53)
+        self.assertEqual(notes, [])
+
+
 if __name__ == "__main__":
     unittest.main()
