@@ -582,5 +582,69 @@ class TestL1Signal(unittest.TestCase):
         self.assertIn("privileged", notes[0])
 
 
+class TestL8RaggedRows(unittest.TestCase):
+    """Backlog L8: format_table() must not IndexError on ragged rows.
+
+    Column widths are a list sized to the headers. A row with more cells
+    than headers currently indexes past that list and crashes the CLI.
+    Extra cells must be dropped (no invented columns); missing cells stay
+    absent (no invented blanks). Valid rectangular rows stay unchanged.
+    """
+
+    # Golden output of the existing TestFormatTable case. Locked so the
+    # defensive change cannot drift normal formatting.
+    VALID = "A       BB\n------  --\nx       y\nlonger  z"
+
+    def test_valid_rows_byte_for_byte(self):
+        out = format_table(["A", "BB"], [["x", "y"], ["longer", "z"]])
+        self.assertEqual(out, self.VALID)
+
+    def test_zero_rows(self):
+        out = format_table(["A", "BB"], [])
+        self.assertEqual(out, "A  BB\n-  --")
+
+    def test_one_valid_row(self):
+        out = format_table(["A", "BB"], [["x", "y"]])
+        self.assertEqual(out, "A  BB\n-  --\nx  y")
+
+    def test_empty_row_does_not_invent_cells(self):
+        out = format_table(["A", "BB"], [[]])
+        self.assertEqual(out, "A  BB\n-  --\n")
+
+    def test_short_row_does_not_invent_cells(self):
+        out = format_table(["A", "BB"], [["only"]])
+        self.assertEqual(out, "A     BB\n----  --\nonly")
+
+    def test_row_longer_than_headers_does_not_crash(self):
+        out = format_table(["A", "BB"], [["x", "y", "EXTRA_CELL"]])
+        self.assertEqual(out, "A  BB\n-  --\nx  y")
+        self.assertNotIn("EXTRA_CELL", out)
+
+    def test_extra_cells_do_not_change_valid_columns(self):
+        valid = [["x", "y"], ["aa", "bb"]]
+        ragged = [["x", "y"], ["aa", "bb", "EXTRA_CELL"]]
+        self.assertEqual(
+            format_table(["A", "B"], ragged),
+            format_table(["A", "B"], valid),
+        )
+
+    def test_mixed_ragged_rows_do_not_crash(self):
+        out = format_table(
+            ["A", "B", "C"],
+            [
+                ["1", "2", "3"],
+                ["only"],
+                [],
+                ["a", "b", "c", "EXTRA_CELL"],
+            ],
+        )
+        self.assertIn("1", out)
+        self.assertIn("2", out)
+        self.assertIn("3", out)
+        self.assertIn("only", out)
+        self.assertNotIn("EXTRA_CELL", out)
+        self.assertEqual(len(out.splitlines()), 6)  # header, sep, 4 data rows
+
+
 if __name__ == "__main__":
     unittest.main()

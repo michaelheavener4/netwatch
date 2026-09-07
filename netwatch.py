@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -413,16 +413,21 @@ def owner_label(owners: list[SocketOwner]) -> str:
 
 def format_table(headers: list[str], rows: list[list[str]]) -> str:
     """Minimal left-aligned table formatter (no dependencies)."""
+    # Bound both passes to the header count: extra cells must not IndexError
+    # on widths, and missing cells stay absent (no invented blanks).
+    col_count = len(headers)
     widths = [len(h) for h in headers]
     for row in rows:
-        for i, cell in enumerate(row):
+        for i, cell in enumerate(row[:col_count]):
             widths[i] = max(widths[i], len(cell))
     lines = [
         "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip(),
         "  ".join("-" * widths[i] for i in range(len(headers))).rstrip(),
     ]
     for row in rows:
-        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+        lines.append("  ".join(
+            cell.ljust(widths[i]) for i, cell in enumerate(row[:col_count])
+        ).rstrip())
     return "\n".join(lines)
 
 
