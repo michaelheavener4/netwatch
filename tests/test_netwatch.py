@@ -758,5 +758,75 @@ class TestL2AttributionLanguage(unittest.TestCase):
         )
 
 
+class TestF1PrivilegedPortEvidence(unittest.TestCase):
+    """Finding F1: port <1024 is not proof that a privileged process bound.
+
+    /proc/net/* evidence actually collected for a service row:
+      - local_port (and local_ip, proto, state, inode)
+      - socket uid (sk_uid), already parsed into Connection.uid
+    That does not establish:
+      - CAP_NET_BIND_SERVICE or euid 0 was required
+      - the current process is privileged
+      - net.ipv4.ip_unprivileged_port_start is still 1024
+    Live counterexample: a port-53 listener with socket uid 974.
+    Keep the conventional '<1024' / 'privileged port' range label (L1);
+    drop the universal 'only a privileged process can bind' claim.
+    Existing TestL1Signal / TestSummary assertions stay intact.
+    """
+
+    def _notes_for(self, **kwargs) -> list[str]:
+        return find_unusual([OwnedConnection(make_conn(**kwargs), [])])
+
+    def test_nonroot_uid_on_low_port_does_not_claim_only_privileged_can_bind(self):
+        # Same shape as the live docker-dns row: port 53, socket uid 974.
+        notes = self._notes_for(
+            state="LISTEN", local_ip="172.17.0.1", local_port=53, uid=974)
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        lowered = notes[0].lower()
+        self.assertNotIn("only a privileged process", lowered)
+        self.assertNotIn("can bind here", lowered)
+        self.assertIn("privileged", lowered)
+        self.assertIn("53", notes[0])
+
+    def test_default_fixture_uid_1000_on_port_22_does_not_claim_bind_privilege(self):
+        # make_conn defaults uid=1000; L1 still uses that fixture.
+        notes = self._notes_for(
+            state="LISTEN", local_ip="0.0.0.0", local_port=22)
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        lowered = notes[0].lower()
+        self.assertNotIn("only a privileged process", lowered)
+        self.assertNotIn("can bind here", lowered)
+        self.assertIn("privileged", lowered)
+        self.assertIn("all interfaces", lowered)
+
+    def test_loopback_privileged_note_does_not_claim_bind_privilege(self):
+        notes = self._notes_for(
+            state="LISTEN", local_ip="127.0.0.1", local_port=631, uid=0)
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        lowered = notes[0].lower()
+        self.assertNotIn("only a privileged process", lowered)
+        self.assertNotIn("can bind here", lowered)
+        self.assertIn("privileged", lowered)
+        self.assertIn("loopback", lowered)
+
+    def test_udp_privileged_note_does_not_claim_bind_privilege(self):
+        notes = self._notes_for(
+            proto="udp", state="STATELESS", local_ip="0.0.0.0",
+            local_port=53, uid=968)
+        self.assertEqual(len(notes), 1, f"expected one note; got: {notes}")
+        lowered = notes[0].lower()
+        self.assertNotIn("only a privileged process", lowered)
+        self.assertNotIn("can bind here", lowered)
+        self.assertIn("privileged", lowered)
+
+    def test_high_port_wildcard_still_has_no_privileged_bind_claim(self):
+        notes = self._notes_for(
+            state="LISTEN", local_ip="0.0.0.0", local_port=8080, uid=1000)
+        self.assertEqual(len(notes), 1)
+        lowered = notes[0].lower()
+        self.assertNotIn("privileged", lowered)
+        self.assertNotIn("can bind here", lowered)
+
+
 if __name__ == "__main__":
     unittest.main()

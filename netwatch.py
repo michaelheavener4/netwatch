@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -536,8 +536,7 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
                 notes.append(
                     f"{service} all interfaces on privileged port (<1024): "
                     f"{conn.proto} {where} ({who}) - reachable from the "
-                    f"network, not just localhost, and only a privileged "
-                    f"process (or one granted the capability) can bind here; "
+                    f"network, not just localhost; "
                     f"check that you expect this service."
                 )
             elif exposure == "wildcard":
@@ -550,9 +549,8 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
                 notes.append(
                     f"privileged port (<1024) on loopback only: {conn.proto} "
                     f"{where} ({who}) - reachable only from this machine, "
-                    f"not from the network; still, only a privileged process "
-                    f"(or one granted the capability) can bind here; check "
-                    f"that you expect this service."
+                    f"not from the network; check that you expect this "
+                    f"service."
                 )
             elif privileged:
                 kind = ("privileged port listening (<1024)"
@@ -561,8 +559,7 @@ def find_unusual(records: list[OwnedConnection]) -> list[str]:
                 notes.append(
                     f"{kind}: {conn.proto} "
                     f"{where} ({who}) - "
-                    "only a privileged process (or one granted the capability) "
-                    "can bind here; check that you expect this service."
+                    "check that you expect this service."
                 )
         if conn.state == "ESTABLISHED" and not rec.owners:
             notes.append(
