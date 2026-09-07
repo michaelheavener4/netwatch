@@ -528,5 +528,59 @@ class TestAdversarial(unittest.TestCase):
         self.assertEqual(proc.wait(), -signal.SIGPIPE)
 
 
+class TestL1Signal(unittest.TestCase):
+    """Backlog L1: heuristic notes must prioritize signal over noise.
+
+    One note per socket (no wildcard+privileged double-flagging), and
+    loopback-only privileged listeners must read as less exposed than
+    wildcard ones while still preserving the privileged-port fact.
+    """
+
+    def test_wildcard_privileged_produces_single_note(self):
+        rec = OwnedConnection(
+            make_conn(state="LISTEN", local_ip="0.0.0.0", local_port=22,
+                      inode=1), [SocketOwner(1, "sshd")])
+        notes = find_unusual([rec])
+        self.assertEqual(len(notes), 1,
+                         f"one socket must yield one note; got: {notes}")
+        self.assertIn("all interfaces", notes[0])
+        self.assertIn("privileged", notes[0])
+        self.assertIn("22", notes[0])
+
+    def test_loopback_privileged_is_distinguished(self):
+        rec = OwnedConnection(
+            make_conn(state="LISTEN", local_ip="127.0.0.1", local_port=22,
+                      inode=1), [SocketOwner(1, "sshd")])
+        notes = find_unusual([rec])
+        self.assertEqual(len(notes), 1,
+                         f"privileged fact must be preserved; got: {notes}")
+        self.assertIn("privileged", notes[0])
+        self.assertIn("loopback", notes[0])
+        self.assertNotIn("all interfaces", notes[0])
+
+    def test_udp_wildcard_privileged_single_note(self):
+        rec = OwnedConnection(
+            make_conn(proto="udp", state="STATELESS", local_ip="0.0.0.0",
+                      local_port=53, inode=3), [])
+        notes = find_unusual([rec])
+        self.assertEqual(len(notes), 1,
+                         f"one socket must yield one note; got: {notes}")
+        lowered = notes[0].lower()
+        self.assertIn("udp", lowered)
+        self.assertIn("53", notes[0])
+        self.assertIn("all interfaces", notes[0])
+        self.assertIn("privileged", notes[0])
+
+    def test_specific_ip_privileged_keeps_its_note(self):
+        # Guard: bound-to-one-interface privileged services must not go
+        # silent as a side effect of the merge.
+        rec = OwnedConnection(
+            make_conn(state="LISTEN", local_ip="172.17.0.1", local_port=53,
+                      inode=1), [])
+        notes = find_unusual([rec])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("privileged", notes[0])
+
+
 if __name__ == "__main__":
     unittest.main()

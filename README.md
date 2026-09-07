@@ -54,13 +54,13 @@ Observed 29 socket(s).
 Counts by protocol:
   tcp: 12
   ...
-Listening ports (7):
+Listening ports - TCP only (7):
 PROTO  LOCAL           UID  INODE
 tcp    0.0.0.0:22      0    10807
 ...
 
 Anything unusual (local heuristics only - prompts, not verdicts):
-  - listening on all interfaces: tcp 0.0.0.0:22 ...
+  - listening on all interfaces on privileged port (<1024): tcp 0.0.0.0:22 ...
 ```
 
 ## Architecture
@@ -154,7 +154,11 @@ record remains, so they can never be attributed.
 - **No verdicts.** `summary` flags wildcard listeners, privileged ports, and
   unattributed connections as *prompts to investigate*, never as threats. A
   clean report is not proof of safety — a rootkit that hides from `/proc`
-  would also hide from this tool.
+  would also hide from this tool. To keep the signal clean, each socket
+  produces at most one heuristic note (exposure and privilege are combined,
+  not double-reported), and loopback-only privileged listeners are worded
+  as less exposed than wildcard ones — while still preserving the
+  privileged-port fact.
 - **Attribution gaps without root.** Expect root-owned service sockets
   (port 22, 53, 631, DHCP, …) to show as unattributed when run as a normal
   user. That is the permission model working, not a bug.

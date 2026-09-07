@@ -24,7 +24,7 @@ import sys
 from dataclasses import dataclass, field
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_PROC_ROOT = "/proc"
 
 # TCP state codes as they appear in /proc/net/tcp (see tcp_states.h in Linux).
@@ -510,28 +510,55 @@ class Summary:
 
 
 def find_unusual(records: list[OwnedConnection]) -> list[str]:
-    """Local-only heuristics. These are prompts to investigate, not verdicts."""
+    """Local-only heuristics. These are prompts to investigate, not verdicts.
+
+    One note per socket at most: exposure (wildcard vs loopback vs a
+    specific interface) and privilege (<1024) are combined into a single
+    note so the operator gets signal, not two notes for one fact pattern.
+    Wording describes observable exposure only - never a verdict.
+    """
     notes: list[str] = []
     for rec in records:
         conn = rec.connection
         who = owner_label(rec.owners)
-        if is_service(conn) and _ip_kind(conn.local_ip) == "wildcard":
-            kind = ("listening on" if is_listening(conn)
-                    else "UDP service on")
-            notes.append(
-                f"{kind} all interfaces: {conn.proto} "
-                f"{endpoint(conn.local_ip, conn.local_port)} ({who}) - "
-                "reachable from the network, not just localhost."
-            )
-        if is_service(conn) and conn.local_port < 1024:
-            kind = ("privileged port listening (<1024)" if is_listening(conn)
-                    else "privileged UDP port (<1024)")
-            notes.append(
-                f"{kind}: {conn.proto} "
-                f"{endpoint(conn.local_ip, conn.local_port)} ({who}) - "
-                "only a privileged process (or one granted the capability) "
-                "can bind here; check that you expect this service."
-            )
+        if is_service(conn):
+            exposure = _ip_kind(conn.local_ip)
+            privileged = conn.local_port < 1024
+            service = ("listening on" if is_listening(conn)
+                       else "UDP service on")
+            where = endpoint(conn.local_ip, conn.local_port)
+            if exposure == "wildcard" and privileged:
+                notes.append(
+                    f"{service} all interfaces on privileged port (<1024): "
+                    f"{conn.proto} {where} ({who}) - reachable from the "
+                    f"network, not just localhost, and only a privileged "
+                    f"process (or one granted the capability) can bind here; "
+                    f"check that you expect this service."
+                )
+            elif exposure == "wildcard":
+                notes.append(
+                    f"{service} all interfaces: {conn.proto} "
+                    f"{where} ({who}) - "
+                    "reachable from the network, not just localhost."
+                )
+            elif privileged and exposure == "loopback":
+                notes.append(
+                    f"privileged port (<1024) on loopback only: {conn.proto} "
+                    f"{where} ({who}) - reachable only from this machine, "
+                    f"not from the network; still, only a privileged process "
+                    f"(or one granted the capability) can bind here; check "
+                    f"that you expect this service."
+                )
+            elif privileged:
+                kind = ("privileged port listening (<1024)"
+                        if is_listening(conn)
+                        else "privileged UDP port (<1024)")
+                notes.append(
+                    f"{kind}: {conn.proto} "
+                    f"{where} ({who}) - "
+                    "only a privileged process (or one granted the capability) "
+                    "can bind here; check that you expect this service."
+                )
         if conn.state == "ESTABLISHED" and not rec.owners:
             notes.append(
                 f"established connection with unknown owner: "
